@@ -1,246 +1,408 @@
-import { safeGuard } from './switch';
-import { BitSet } from './bit-set';
-import {
-  ComponentFromSchema,
-  ComponentListFromSchemaList,
-  ComponentSchema,
-  ComponentSchemaId,
-  ComponentSchemaKind,
-  DataValuesFromComponentSchemas,
-} from './component';
-import { Entity } from './entity';
+import { Entity, $kind } from './core';
 import { SparseSet } from './sparse-set';
+import { Schema, KindToType, SchemaId, $tag, $aos, $soa, Component } from './schema';
+import { Internals } from './internals';
+import { ArrayContains } from './ts-types';
+import { safeGuard } from './switch';
+import { isEntityInArchetype } from '.';
+
+export type ArchetypeTableRow<S extends Schema> = KindToType<S>[];
+
+export type ArchetypeTable<SL extends ReadonlyArray<Schema>> = {
+  [K in keyof SL]: ArchetypeTableRow<SL[K]>;
+};
 
 export type ArchetypeId = string;
 
-export type Archetype<CSL extends ReadonlyArray<ComponentSchema> = ReadonlyArray<ComponentSchema>> = {
-  // # Identifiers
-  id: ArchetypeId;
-  mask: BitSet;
-
-  // # Archetypes graph
-  adjacent: Archetype<any>[];
-
-  // # Entities
-  sSet: SparseSet<Entity>;
-  entities: Entity[];
-
-  // # Components
-  components: ComponentListFromSchemaList<CSL>; // components sparse array
+export const newArchetypeId = (schemas: Schema[]) => {
+  return schemas
+    .map((component) => Internals.getSchemaId(component))
+    .sort((a, b) => a - b)
+    .join(',');
 };
 
-export const Archetype = {
-  // TODO: Pass component schemas to prefabricate components
-  new: <CSL extends ReadonlyArray<ComponentSchema>>(
-    id: ArchetypeId,
-    componentSchemas: CSL,
-    mask: BitSet
-  ): Archetype<CSL> => {
-    const sSet = SparseSet.new();
+export type Archetype<SL extends ReadonlyArray<Schema> = ReadonlyArray<Schema>> = {
+  id: ArchetypeId;
+  type: SL;
+  entitiesSS: SparseSet;
+  entities: number[]; // dense
+  table: ArchetypeTable<SL>;
+};
 
-    const components = [];
+// OK, BUT can be changed to bitmask
+// export function hasSchema<S extends Schema>(arch: Archetype<any>, schema: S): boolean {
+//   const schemaId = Internals.getSchemaId(schema);
+//   return arch.table[schemaId] !== undefined;
+// }
 
-    for (let i = 0; i < componentSchemas.length; i++) {
-      const componentSchema = componentSchemas[i];
+export function hasSchema<SL extends ReadonlyArray<Schema>, S extends Schema>(
+  arch: Archetype<SL>,
+  schema: S
+): Archetype<[S, ...SL]> | undefined {
+  const schemaId = Internals.getSchemaId(schema);
+  if (arch.table[schemaId] !== undefined) {
+    return arch as unknown as Archetype<[S, ...SL]>;
+  }
 
-      switch (componentSchema.kind) {
-        case ComponentSchemaKind.SoA: {
-          components[componentSchema.id] = {
-            schema: componentSchema,
-            data: componentSchema.default,
-          };
+  return;
+}
 
-          break;
+// OK
+export function hasEntity(arch: Archetype<any>, entity: Entity) {
+  const denseInd = arch.entitiesSS.sparse[entity];
+  if (denseInd === undefined) {
+    return false;
+  }
+  return arch.entitiesSS.dense[denseInd] === entity;
+}
+
+// OK
+export function addArchetypeEntity<CL extends Schema[]>(arch: Archetype<CL>, entity: Entity) {
+  // # Add entity to archetype
+  SparseSet.add(arch.entitiesSS, entity);
+
+  for (let i = 0; i < arch.type.length; i++) {
+    const schema = arch.type[i];
+
+    switch (schema[$kind]) {
+      case $tag:
+        continue;
+      case $aos:
+        const schemaId = Internals.getSchemaId(schema);
+
+        const componentTable = arch.table[schemaId];
+
+        if (!componentTable) {
+          throw new Error(`Can't find component ${schemaId} on this archetype ${arch.id}`);
         }
-        case ComponentSchemaKind.Tag: {
-          components[componentSchema.id] = {
-            schema: componentSchema,
-            data: undefined,
-          };
 
-          break;
-        }
-        default: {
-          safeGuard(componentSchema);
-        }
-      }
+        const component = Schema.default(schema);
+
+        componentTable.push(component);
+        break;
+      case $soa:
+        throw new Error('Not implemented');
+      default:
+        safeGuard(schema[$kind]);
     }
+  }
+}
 
-    return {
-      sSet: sSet,
-      entities: sSet.dense,
-      id,
-      mask,
-      adjacent: [],
-      components: components as ComponentListFromSchemaList<CSL>,
-    };
-  },
+// OK
+export function removeEntity<CL extends Schema[]>(arch: Archetype<CL>, entity: Entity) {
+  // # Remove entity and component to archetype
+  const sSet = arch.entitiesSS;
 
-  hasComponent: (arch: Archetype, componentId: ComponentSchemaId) => {
-    return BitSet.has(arch.mask, componentId);
-  },
+  const denseInd = sSet.sparse[entity];
 
-  getComponent: <CSL extends ReadonlyArray<ComponentSchema>, CS extends CSL[number]>(
-    arch: Archetype<CSL>,
-    componentSchema: CS
-  ): ComponentFromSchema<CS> => {
-    const componentId = componentSchema.id;
-    const component = arch.components[componentId];
-    if (!component) {
-      throw new Error(`Can't find component ${componentSchema.id} on this archetype ${arch.id}`);
-    }
-    return component as ComponentFromSchema<CS>;
-  },
+  if (sSet.dense[denseInd] === entity && sSet.dense.length > 0) {
+    const swapEntity = sSet.dense.pop()!;
 
-  hasEntity: (arch: Archetype, entity: Entity) => {
-    return SparseSet.has(arch.sSet, entity);
-  },
+    for (let i = 0; i < arch.type.length; i++) {
+      const schema = arch.type[i];
 
-  removeEntity: (arch: Archetype, entity: Entity) => {
-    const swapEntityId = arch.sSet.dense.pop()!;
+      switch (schema[$kind]) {
+        case $tag:
+          continue;
+        case $aos:
+          const componentId = Internals.getSchemaId(schema);
 
-    if (swapEntityId !== entity) {
-      // # If we popped incorrect entity, than pop it from all components and swap with correct
-      const swapIndexInDense = arch.sSet.sparse[entity]!;
-      arch.sSet.dense[swapIndexInDense] = swapEntityId;
-      arch.sSet.sparse[swapEntityId] = swapIndexInDense;
-
-      for (let i = 0; i < arch.components.length; i++) {
-        const component = arch.components[i];
-        if (!component) continue;
-        // # Skip tags
-        switch (component.schema.kind) {
-          case ComponentSchemaKind.SoA: {
-            // # Get shape keys (like x, y in Position)
-            for (let i = 0; i < component.schema.shape.length; i++) {
-              const key = component.schema.shape[i];
-              const array = component.data![key];
-              const val = array.pop();
-              // # Swap
-              array[swapIndexInDense] = val;
-            }
-            break;
+          const componentTable = arch.table[componentId];
+          if (!componentTable) {
+            continue;
           }
-          case ComponentSchemaKind.Tag: {
-            break;
-          }
-          default: {
-            safeGuard(component.schema);
-          }
-        }
-      }
-    } else {
-      // # If we popped correct entity, than just pop it from all components
-      for (let i = 0; i < arch.components.length; i++) {
-        const component = arch.components[i];
-        if (!component) continue;
-        // # Skip tags
-        switch (component.schema.kind) {
-          case ComponentSchemaKind.SoA: {
-            // # Get shape keys (like x, y in Position)
-            for (let i = 0; i < component.schema.shape.length; i++) {
-              const key = component.schema.shape[i];
-              const array = component.data![key];
-              array.pop();
-            }
-            break;
-          }
-          case ComponentSchemaKind.Tag: {
-            break;
-          }
-          default: {
-            safeGuard(component.schema);
-          }
-        }
-      }
-    }
-  },
 
-  addEntity: <CSL extends ReadonlyArray<ComponentSchema>>(
-    arch: Archetype,
-    entity: Entity,
-    initialComponentData?: DataValuesFromComponentSchemas<CSL>
-  ) => {
-    // Add entity to sSet
-    arch.sSet.dense.push(entity);
-    const archDenseIndex = arch.sSet.dense.length - 1;
-    arch.sSet.sparse[entity] = archDenseIndex;
-
-    for (let i = 0; i < arch.components.length; i++) {
-      const component = arch.components[i];
-      if (!component) continue;
-      switch (component.schema.kind) {
-        case ComponentSchemaKind.SoA: {
-          // # TODO: Test this
-          // # Create initial from initialComponentData or default
-          const def =
-            initialComponentData && initialComponentData[i] ? initialComponentData[i]! : component.schema.defaultValues;
-          // # Get shape keys (like x, y in Position)
-          for (let i = 0; i < component.schema.shape.length; i++) {
-            const key = component.schema.shape[i];
-            const array = component.data![key];
-            // # Put entity default value on the same index as entity in dense array
-            array[archDenseIndex] = def[key];
+          const component = componentTable.pop()!;
+          if (swapEntity !== entity) {
+            componentTable[denseInd] = component;
           }
           break;
-        }
-        case ComponentSchemaKind.Tag: {
-          // # Skip tags
-          break;
-        }
-        default: {
-          safeGuard(component.schema);
-        }
+        case $soa:
+          throw new Error('Not implemented');
+        default:
+          safeGuard(schema[$kind]);
       }
     }
-  },
+    if (swapEntity !== entity) {
+      sSet.dense[denseInd] = swapEntity;
+      sSet.sparse[swapEntity] = denseInd;
+    }
+  }
 
-  moveEntity: (from: Archetype, to: Archetype, entity: Entity) => {
-    // # Check if entity is in `to` or not in `from`
-    if (to.sSet.dense[to.sSet.sparse[entity]!] === entity || from.sSet.dense[from.sSet.sparse[entity]!] !== entity) {
+  return;
+}
+
+/**
+ *
+ * Move entity from one archetype to another:
+ *
+ * 1. If `from` does not have entity or `to` already has entity then return false.
+ * 2. Add entity to `to` archetype.
+ * 3. Move all components to `to` archetype. If there is no component in `from` archetype,
+ * then add default component.
+ * 4. Remove entity from `from` archetype.
+ *
+ */
+export function moveEntity<CL extends Schema[]>(
+  from: Archetype<CL>,
+  to: Archetype<CL>,
+  entity: Entity,
+  newSchema?: Schema,
+  newComponent?: Component<Schema>
+) {
+  // # Check if entity is in `to` or not in `from`
+  if (
+    to.entitiesSS.dense[to.entitiesSS.sparse[entity]] === entity ||
+    from.entitiesSS.dense[from.entitiesSS.sparse[entity]] !== entity
+  ) {
+    return false;
+  }
+
+  // # Add to new archetype
+  SparseSet.add(to.entitiesSS, entity);
+
+  // # Move all Components to new Archetype Table
+  const fromDenseEntityInd = from.entitiesSS.sparse[entity]!;
+  for (let i = 0; i < to.table.length; i++) {
+    const schemaId = i;
+
+    const toComponentTable = to.table[schemaId];
+    if (!toComponentTable) {
+      continue;
+    }
+
+    const fromComponentTable = from.table[schemaId];
+    if (!fromComponentTable) {
+      // # If there is schema in `to` but not in `from` then add default component
+      updateComponent(to, entity, schemaId, undefined);
+      continue;
+    }
+
+    const schema = Internals.getSchemaById(schemaId);
+    if (!schema) {
+      throw new Error(`Can't find schema ${schemaId}`);
+    }
+
+    switch (schema[$kind]) {
+      case $tag:
+        continue;
+      case $soa:
+        throw new Error('Not implemented');
+      case $aos:
+        updateComponent(to, entity, schemaId, fromComponentTable[fromDenseEntityInd]);
+        break;
+      default:
+        safeGuard(schema[$kind]);
+    }
+  }
+
+  // # Add new component if needed
+  if (newSchema) {
+    updateComponent(to, entity, newSchema, newComponent);
+  }
+
+  // # Remove it from `from` entities (sSet dense) and components
+  Archetype.removeEntity(from, entity);
+}
+
+// OK
+export function updateComponent<S extends Schema>(
+  arch: Archetype<any>,
+  entity: Entity,
+  schemaOrId: SchemaId | Schema,
+  component?: Component<S>
+): boolean {
+  const schemaId = typeof schemaOrId === 'number' ? schemaOrId : Internals.getSchemaId(schemaOrId);
+  const schema = (typeof schemaOrId === 'number' ? Internals.getSchemaById(schemaOrId) : schemaOrId) as S | undefined;
+
+  if (!schema) {
+    throw new Error(`Can't find schema ${schemaId}`);
+  }
+
+  // # Add component to archetype
+  const componentTable = arch.table[schemaId];
+
+  if (!componentTable) {
+    throw new Error(`Can't find component ${schemaId} on this archetype ${arch.id}`);
+  }
+
+  const sSet = arch.entitiesSS;
+  const denseInd = sSet.sparse[entity] as number | undefined;
+
+  const isEntityNotInArchetype =
+    entity >= sSet.sparse.length ||
+    denseInd === undefined ||
+    denseInd >= sSet.dense.length ||
+    sSet.dense[denseInd] !== entity;
+
+  // # Check that component is not in this archetypes table
+  if (isEntityNotInArchetype) {
+    throw new Error(`Entity ${entity} is not in this archetype ${arch.id}`);
+  }
+
+  // # Set component if it is in this archetypes table
+  switch (schema[$kind]) {
+    case $tag:
+      return true;
+    case $aos:
+      if (
+        entity < sSet.sparse.length &&
+        denseInd !== undefined &&
+        denseInd < sSet.dense.length &&
+        sSet.dense[denseInd] === entity
+      ) {
+        const newComponent = component ?? Schema.default(schema);
+        componentTable[denseInd] = newComponent;
+        return true;
+      }
       return false;
-    }
+    case $soa:
+      throw new Error('Not implemented');
+    default:
+      return safeGuard(schema[$kind]);
+  }
+}
 
-    // # Add to new archetype
-    const swapIndexInDense = from.sSet.sparse[entity]!;
+// OK
+export function componentsList<SL extends ReadonlyArray<Schema>, A extends Archetype<any>>(
+  archetype: A,
+  entity: Entity,
+  ...schemas: A extends Archetype<infer iCL> ? (ArrayContains<iCL, SL> extends true ? SL : never) : never
+) {
+  return schemas.map((schema) => {
+    const schemaId = Internals.getSchemaId(schema);
+    const componentIndex = archetype.entitiesSS.sparse[entity];
+    return archetype.table[schemaId][componentIndex];
+  }) as {
+    [K in keyof SL]: KindToType<SL[K]>;
+  };
+}
 
-    to.sSet.dense.push(entity);
-    const toDenseIndex = to.sSet.dense.length - 1;
-    to.sSet.sparse[entity] = toDenseIndex;
+// OK
+export function component<S extends Schema, A extends Archetype<ReadonlyArray<Schema>>>(
+  archetype: A,
+  entity: Entity,
+  schema: A extends Archetype<infer iCL>
+    ? iCL extends any
+      ? S
+      : ArrayContains<iCL, [S]> extends true
+      ? S
+      : never
+    : never
+): KindToType<S> {
+  const componentId = Internals.getSchemaId(schema);
+  const componentIndex = archetype.entitiesSS.sparse[entity];
+  const componentTable = archetype.table[componentId];
+  if (!componentTable) {
+    throw new Error(`Can't find component ${componentId} on this archetype ${archetype.id}`);
+  }
+  if (schema[$kind] === $tag) {
+    return {} as KindToType<S>;
+  }
+  const component = componentTable[componentIndex];
+  if (!component) {
+    throw new Error(`Can't find component ${componentId} on this archetype ${archetype.id}`);
+  }
+  return component as KindToType<S>;
+}
 
-    for (let i = 0; i < to.components.length; i++) {
-      const component = to.components[i];
-      if (!component) continue;
+export function tryComponent<S extends Schema>(
+  archetype: Archetype<any>,
+  entity: Entity,
+  schema: S
+): KindToType<S> | undefined {
+  if (!isEntityInArchetype(archetype, entity)) {
+    return undefined;
+  }
+  const componentId = Internals.getSchemaId(schema);
+  const componentIndex = archetype.entitiesSS.sparse[entity];
+  const componentTable = archetype.table[componentId];
+  if (!componentTable) {
+    return undefined;
+  }
+  if (schema[$kind] === $tag) {
+    return {} as KindToType<S>;
+  }
+  const component = componentTable[componentIndex];
+  if (!component) {
+    return undefined;
+  }
+  return component as KindToType<S> | undefined;
+}
 
-      const fromComponent = from.components[component.schema.id];
+// OK
+export const table = <S extends Schema, A extends Archetype<any>>(
+  archetype: A,
+  schema: A extends Archetype<infer iCL> ? (ArrayContains<iCL, [S]> extends true ? S : never) : never
+) => {
+  const componentId = Internals.getSchemaId(schema);
+  const table = archetype.table[componentId];
+  if (!table) {
+    throw new Error(`Can't find component ${componentId} on this archetype ${archetype.id}`);
+  }
+  return table as ArchetypeTableRow<S>;
+};
 
-      switch (component.schema.kind) {
-        case ComponentSchemaKind.SoA: {
-          // # Get shape keys (like x, y in Position)
-          for (let i = 0; i < component.schema.shape.length; i++) {
-            const key = component.schema.shape[i];
-            const array = component.data![key];
-            if (fromComponent) {
-              array[toDenseIndex] = fromComponent.data![key][swapIndexInDense];
-            } else {
-              array[toDenseIndex] = component.schema.defaultValues[key];
-            }
-          }
-          break;
-        }
-        case ComponentSchemaKind.Tag: {
-          // # Skip tags
-          break;
-        }
-        default: {
-          safeGuard(component.schema);
-        }
-      }
-    }
+// OK
+export const tryTable = <S extends Schema>(archetype: Archetype<any>, schema: S): ArchetypeTableRow<S> | undefined => {
+  const componentId = Internals.getSchemaId(schema);
+  return archetype.table[componentId] as ArchetypeTableRow<S> | undefined;
+};
 
-    // # Remove it from `from` entities (sSet dense) and components
-    Archetype.removeEntity(from, entity);
+// OK
+export const tablesList = <SL extends ReadonlyArray<Schema>, A extends Archetype<any>>(
+  archetype: A,
+  ...components: A extends Archetype<infer iCL> ? (ArrayContains<iCL, SL> extends true ? SL : never) : never
+) => {
+  return components.map((component) => {
+    const componentId = Internals.getSchemaId(component);
+    return archetype.table[componentId];
+  }) as {
+    [K in keyof SL]: KindToType<SL[K]>[];
+  };
+};
 
-    return true;
-  },
+// OK
+export const tryTablesList = <SL extends ReadonlyArray<Schema>>(archetype: Archetype<any>, ...components: SL) => {
+  return components.map((component) => {
+    const componentId = Internals.getSchemaId(component);
+    return archetype.table[componentId];
+  }) as {
+    [K in keyof SL]: KindToType<SL[K]>[] | undefined;
+  };
+};
+
+export function newArchetype<SL extends Schema[]>(...schemas: SL) {
+  const ss = SparseSet.new();
+  const archId = newArchetypeId(schemas);
+  const archetype: Archetype<SL> = {
+    id: archId,
+    type: schemas,
+    entitiesSS: ss,
+    entities: ss.dense,
+    table: schemas.reduce((acc, schema) => {
+      acc[Internals.getSchemaId(schema)] = [];
+      return acc;
+    }, [] as ArchetypeTable<SL>),
+  };
+
+  return archetype;
+}
+
+export const archetypeZero = newArchetype();
+export const archetypeZeroId = newArchetypeId(archetypeZero.type);
+
+// eslint-disable-next-line @typescript-eslint/no-redeclare
+export const Archetype = {
+  new: newArchetype,
+  hasSchema,
+  hasEntity,
+  componentsList,
+  component,
+  table,
+  tablesList,
+  updateComponent,
+  addEntity: addArchetypeEntity,
+  removeEntity,
+  moveEntity,
 };
