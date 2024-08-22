@@ -1,6 +1,6 @@
 # tECS – TypeScript ECS library
 
-Experimental Archetype + SoA based ECS library for TypeScript.
+Archetype based ECS library for TypeScript.
 
 # Design
 
@@ -25,6 +25,7 @@ Experimental Archetype + SoA based ECS library for TypeScript.
 1. Default events (entitySpawned, entityKilled, componentAdded, componentRemoved, componentUpdated)
 1. Archetype Queries with cache
 1. Defer add and remove entities and components
+1. No external dependencies
 
 # Roadmap
 
